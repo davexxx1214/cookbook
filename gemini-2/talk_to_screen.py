@@ -24,6 +24,7 @@ import cv2
 import pyaudio
 import PIL.Image
 import json
+import mss
 
 from google import genai
 
@@ -44,11 +45,11 @@ with open('config.json', 'r') as f:
 MODEL = config['model']
 GOOGLE_API_KEY = config['api_key']
 
-# 将 API 密钥传递给 Client 构造函数
 client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1alpha'})
 
-CONFIG={
-    "generation_config": {"response_modalities": ["AUDIO"]}}
+CONFIG = {
+    "generation_config": {"response_modalities": ["AUDIO"]}
+}
 
 pya = pyaudio.PyAudio()
 
@@ -58,7 +59,7 @@ class AudioLoop:
         self.audio_in_queue = asyncio.Queue()
         self.audio_out_queue = asyncio.Queue()
         self.video_out_queue = asyncio.Queue()
-
+        self.frame_queue = asyncio.Queue()  # 用于主线程和异步任务之间传递帧数据
         self.session = None
 
         self.send_text_task = None
@@ -72,14 +73,14 @@ class AudioLoop:
                 break
             await self.session.send(text or ".", end_of_turn=True)
 
-    def _get_frame(self, cap):
-        # Read the frameq
-        ret, frame = cap.read()
-        # Check if the frame was read successfully
-        if not ret:
-            return None
+    def _get_frame(self, sct):
+        monitor = sct.monitors[1]
+        sct_img = sct.grab(monitor)
 
-        img = PIL.Image.fromarray(frame)
+        if not sct_img:
+            return None
+        
+        img = PIL.Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         img.thumbnail([1024, 1024])
 
         image_io = io.BytesIO()
@@ -90,22 +91,20 @@ class AudioLoop:
         image_bytes = image_io.read()
         return {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}
 
-    async def get_frames(self):
-        # This takes about a second, and will block the whole program
-        # causing the audio pipeline to overflow if you don't to_thread it.
-        cap = await asyncio.to_thread(cv2.VideoCapture, 0)  # 0 represents the default camera
+    async def capture_frames(self): # 主线程执行
+        with mss.mss() as sct:
+           while True:
+                frame = self._get_frame(sct)
+                if frame is None:
+                    break
+                self.frame_queue.put_nowait(frame)  # 将帧数据放入队列
+                await asyncio.sleep(1.0)
 
+    async def get_frames(self): # 异步任务，从队列读取数据
         while True:
-            frame = await asyncio.to_thread(self._get_frame, cap)
-            if frame is None:
-                break
-
-            await asyncio.sleep(1.0)
-
+            frame = await self.frame_queue.get()
             self.video_out_queue.put_nowait(frame)
 
-        # Release the VideoCapture object
-        cap.release()
 
     async def send_frames(self):
         while True:
@@ -175,6 +174,7 @@ class AudioLoop:
 
         Splits and displays files if the queue pauses for more than `max_pause`.
         """
+        
         async with (
             client.aio.live.connect(model=MODEL, config=CONFIG) as session,
             asyncio.TaskGroup() as tg,
@@ -182,24 +182,25 @@ class AudioLoop:
             self.session = session
 
             send_text_task = tg.create_task(self.send_text())
-
+            
             def cleanup(task):
-                for t in tg._tasks:
-                    t.cancel()
-
+                 for t in tg._tasks:
+                     t.cancel()
             send_text_task.add_done_callback(cleanup)
-
+            
             tg.create_task(self.listen_audio())
             tg.create_task(self.send_audio())
             tg.create_task(self.get_frames())
             tg.create_task(self.send_frames())
             tg.create_task(self.receive_audio())
             tg.create_task(self.play_audio())
+            
+            # 在这里启动主线程的帧捕获任务
+            asyncio.create_task(self.capture_frames())
 
             def check_error(task):
                 if task.cancelled():
                     return
-
                 if task.exception() is None:
                     return
 
@@ -209,7 +210,6 @@ class AudioLoop:
 
             for task in tg._tasks:
                 task.add_done_callback(check_error)
-
 
 if __name__ == "__main__":
     main = AudioLoop()
