@@ -1,0 +1,4 @@
+{
+    "api_key": "YOUR-API-KEY",
+    "model": "models/gemini-2.0-flash-exp"
+}
